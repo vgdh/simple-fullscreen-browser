@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Fullscreen Web</string>
+    <string name="setup_title">Start page</string>
+    <string name="setup_message">Address of the page to open. Asked once — to change it later, clear this app\'s data.</string>
+    <string name="setup_empty">Enter an address</string>
+    <string name="load_failed">Load failed: %1$s\nTo change the address, clear this app\'s data.</string>
+    <!-- Prefilled in the setup dialog only. -->
+    <string name="default_url">https://www.google.com/</string>
+</resources>
