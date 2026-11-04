@@ -45,7 +45,7 @@ incognito, ad blocking, settings screen. Every one of those is a step away from
 
 ## Install
 
-Grab `fullscreen-web.apk` from [Releases](../../releases/latest), then either:
+Grab `fullscreen-web.apk` from [Releases](releases/latest), then either:
 
 ```bash
 adb install -r fullscreen-web.apk
