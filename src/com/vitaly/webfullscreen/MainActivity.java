@@ -118,6 +118,9 @@ public class MainActivity extends Activity {
     private long lastBackAt;
     private long exitArmedAt;
 
+    /** Consecutive commits of the engine's own about:blank; 3 strikes then idle. */
+    private int blankLoads;
+
     /** Last committed location, fed by onLocationChange (159 has no getCurrentUri). */
     private String currentUri;
 
@@ -218,7 +221,7 @@ public class MainActivity extends Activity {
         String url = urlFrom(intent);
         if (url != null) {
             if (storedUrl() == null) persist(url);
-            load(url);
+            loadWhenReady(url);
         } else if (session != null && pageLoaded) {
             // Relaunched with no explicit URL: the page on screen may be hours
             // old, which is what a kiosk dashboard must never show. Bypass the
@@ -295,15 +298,41 @@ public class MainActivity extends Activity {
         public void onPageStop(GeckoSession s, boolean success) {
             // Gecko paints its own progress; we only care about restoring the
             // immersive bars, which video fullscreen can knock out.
-            pageLoaded = true;
-            retryCount = 0;
             if (loadWatchdog != null) {
                 mainHandler.removeCallbacks(loadWatchdog);
                 loadWatchdog = null;
             }
             diag("page-stop success=" + success + " painted=" + painted
                     + " " + shortUri(currentUri));
-            if (success && !painted && !repaintRetryDone) {
+
+            // The engine can commit its own initial about:blank and silently drop
+            // the load we issued. Every later "success" then refers to that blank
+            // document, so the screen stays white for ever -- re-issue the load.
+            if (isBlankUri(currentUri) && targetUrl != null && !isBlankUri(targetUrl)) {
+                pageLoaded = false;
+                if (blankLoads < 3) {
+                    blankLoads++;
+                    diag("blank document, loading again " + blankLoads + "/3");
+                    mainHandler.post(() -> { if (session != null) load(targetUrl); });
+                } else {
+                    diag("stuck on about:blank");
+                }
+                enterImmersive();
+                return;
+            }
+            blankLoads = 0;
+
+            if (!success) {
+                pageLoaded = false;
+                diag("page-stop failed, retrying");
+                scheduleRetry();
+                enterImmersive();
+                return;
+            }
+
+            pageLoaded = true;
+            retryCount = 0;
+            if (!painted && !repaintRetryDone) {
                 // "Loaded" without a paint is a blank kiosk: the engine holds the
                 // document, the wallpaper-less black screen shows nothing.
                 repaintRetryDone = true;
@@ -391,6 +420,40 @@ public class MainActivity extends Activity {
 
     // ---------------------------------------------------------------- url logic
 
+    private static boolean isBlankUri(String u) {
+        return u != null && u.startsWith("about:");
+    }
+
+    /**
+     * Issue the first load only once GeckoSession.open() has completed. Calling
+     * loadUri() earlier is silently swallowed by the engine's own about:blank
+     * navigation, which is exactly the "white screen on some launches" fault.
+     */
+    private void loadWhenReady(String url) {
+        if (url == null || session == null) return;
+        if (session.isOpen()) {
+            load(url);
+            return;
+        }
+        diag("waiting for session open");
+        awaitOpen(url, 0);
+    }
+
+    private void awaitOpen(String url, int attempt) {
+        if (isFinishing() || session == null) return;
+        if (session.isOpen()) {
+            diag("session open after " + (attempt * 50) + "ms");
+            load(url);
+            return;
+        }
+        if (attempt >= 40) {          // 2s is long enough for open() on any TV box
+            diag("session never opened, loading anyway");
+            load(url);
+            return;
+        }
+        mainHandler.postDelayed(() -> awaitOpen(url, attempt + 1), 50);
+    }
+
     private void startWithIntentOrSaved(Intent intent) {
         String url = urlFrom(intent);
         if (url != null && storedUrl() == null) {
@@ -399,7 +462,7 @@ public class MainActivity extends Activity {
         }
         final String target = url != null ? url : storedUrl();
         clearProfileOnce(() -> {
-            if (target != null) load(target);
+            if (target != null) loadWhenReady(target);
             else promptForUrl();
         });
     }
