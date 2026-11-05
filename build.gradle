@@ -1,0 +1,83 @@
+plugins {
+    id 'com.android.application' version '9.5.0'
+}
+
+android {
+    namespace 'com.vitaly.webfullscreen'
+    // GeckoView 159's AAR metadata requires 37.2 (minor SDK versions are a
+    // thing since Android 16); compileSdkMinor carries the ".2".
+    compileSdk 37
+    compileSdkMinor 2
+
+    defaultConfig {
+        applicationId 'com.vitaly.webfullscreen'
+        // GeckoView 159 refuses anything below API 26; the TV reports 31.
+        minSdk 26
+        targetSdk 34
+        versionCode 6
+        versionName '2.0-geckoview'
+
+        // Default: universal APK (both ABIs). Override with
+        //   -Pabis=arm64-v8a         (half the size, needs a 64-bit TV)
+        def abis = (project.findProperty('abis') ?: 'arm64-v8a,armeabi-v7a')
+                .toString().split(',') as List
+        ndk {
+            abiFilters(*abis)
+        }
+    }
+
+    // Keep the existing hand-rolled layout instead of the Gradle default one.
+    sourceSets {
+        main {
+            manifest.srcFile 'AndroidManifest.xml'
+            java.srcDirs = ['src']
+            res.srcDirs = ['res']
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    // Same key the previous WebView builds used, so the new APK installs over
+    // the existing app instead of demanding an uninstall.
+    signingConfigs {
+        release {
+            storeFile file('keystore/debug.keystore')
+            storePassword 'android'
+            keyAlias 'debug'
+            keyPassword 'android'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    // Compress the .so files: keeps the APK near 180 MB instead of ~330 MB,
+    // and the system unpacks them at install time (extractNativeLibs=true).
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {
+    // The omni artifact carries every ABI; the per-ABI artifacts cannot be
+    // combined, because each one declares the same Gradle capability
+    // (org.mozilla.geckoview:geckoview) and Gradle rejects picking both.
+    // abiFilters above strips the x86_64 payload from the APK.
+    implementation 'org.mozilla.geckoview:geckoview:159.0.20261102144711'
+}

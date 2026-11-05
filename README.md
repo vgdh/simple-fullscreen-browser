@@ -1,167 +1,148 @@
 # Simple Fullscreen Browser
 
-A ~90 KB Android app that shows **one web page fullscreen, with no browser UI at
-all**, and closes on **back**. Built to be launched from **Kodi** on Android
-phones and TV boxes, but it also runs fine from the app drawer.
-
-Plain `http://` works. Nothing is locked: no lock task, no device owner, no kiosk
-mode, no admin rights — back always gets you out.
+A single-activity, chrome-less browser for Android TV / kiosk screens. It shows one
+web page fullscreen — no address bar, no tabs, no navigation UI — and exits on **back**.
+Built to be launched from **Kodi** (see the companion `plugin.program.android.launcher`
+addon), but it runs fine from the app drawer too.
 
 ```
 Kodi  ──StartAndroidActivity──▶  Fullscreen Web  ──back──▶  Kodi
 ```
 
-## Why this exists
+* Package: `com.vitaly.webfullscreen`
+* Current version: **2.0-geckoview** (versionCode 6) — minSdk 26, targetSdk 34
+* Plain `http://` works. No lock task, no device owner, no kiosk mode, no admin rights.
 
-Filling a screen with one page sounds trivial until you look at the options:
+## Why the rendering engine is bundled
 
-| Option | Why it fails |
-|---|---|
-| Kiosk / digital-signage apps | Paid, or they lock the device down with lock task, device-owner or COSU |
-| PWA / WebAPK | Requires a web app manifest **served over HTTPS** — useless for a LAN page on `http://` |
-| Kodi add-ons that "open a browser" | Windows/Linux only; nothing to hand off to on Android |
-| Full browsers in fullscreen | Address bar, tabs and gestures come back the moment you touch the screen |
+Version 1.x rendered with the device's system WebView. On the target TV that WebView is
+permanently stuck at **Chrome 85**, and the WebView component cannot be updated there:
+the image ships a vendor-signed provider, so Google-signed WebView builds from Play or
+APKMirror fail the signature check, and Play never offers the component for that build
+at all.
 
-So: a single `Activity` around a `WebView`. No Gradle, no AndroidX, one class,
-one dependency — the platform.
+Chrome 85 predates CSS Cascade Layers (`@layer`, shipped in Chrome 99). Modern dashboard
+builds — Homer v24.10.1 and newer, for instance — wrap their **entire** stylesheet in
+`@layer`, so Chrome 85 parses the file down to **zero rules**: correct markup, correct
+bytes on the wire (200, 784 KB, verified in the server log), completely unstyled page.
 
-## Features
+Version 2.0 therefore embeds **GeckoView 159** — the Firefox engine — inside the APK.
+The engine ships and versions with the app; the device's WebView is not used at all.
+The final dex has zero references to `android.webkit.WebView`.
 
-- URL comes from the intent: string extra `url` first, then `ACTION_VIEW` data.
-- Fullscreen via immersive-sticky flags, re-applied on focus change. No address
-  bar, no toolbar, ever.
-- Screen kept awake while visible (`FLAG_KEEP_SCREEN_ON`).
-- JavaScript + DOM storage on, `mediaPlaybackRequiresUserGesture=false` so
-  autoplaying video works without a tap, fullscreen video supported.
-- Back does page history first, then `finish()` — you land straight back in Kodi.
-  `KEYCODE_BACK` is handled explicitly too, so D-pad remotes behave like a phone.
-- First run with no URL asks for the address once and remembers it.
-- A failed load shows a toast with the error instead of a silent black screen.
-- Permission: `INTERNET` only. `minSdk 21` (Android 5.0), `targetSdk 34`.
+The cost is size (see [size and storage](#size-and-storage)), because the APK carries a
+real browser: `libxul.so` and `assets/omni.ja` per ABI.
 
-Deliberately **not** included: tabs, bookmarks, zoom, downloads, file pickers,
-incognito, ad blocking, settings screen. Every one of those is a step away from
-"press a key in Kodi, see the page".
+## Behaviour
 
-## Install
+* **Start URL** comes from an `EXTRA_URL` extra or a `view` intent; on first run it is
+  asked once and stored in `SharedPreferences` (`webfullscreen` / `start_url`), so a
+  cold start needs no interaction.
+* **Immersive**: system bars hidden and re-hidden on window focus, resume, page load and
+  HTML5 fullscreen transitions (video players knock them back out).
+* **Desktop engine profile**: `USER_AGENT_MODE_DESKTOP` + `VIEWPORT_MODE_DESKTOP`, so the
+  page gets the desktop layout instead of whatever a TV user-agent sniff would produce.
+* **`DISPLAY_MODE_FULLSCREEN`**, so viewport units resolve against the whole screen —
+  `100vh` equals screen height, which is what kiosk dashboards assume.
+* **Back** (remote or keyboard) walks page history first, then finishes back to Kodi.
+  `KEYCODE_BACK` is handled directly because some boxes never reach `onBackPressed`.
+* **Load errors** show a toast and keep the black background — no browser error page on
+  a wall-mounted screen.
+* JavaScript on, remote debugging on, `about:config` available, `largeHeap="true"`.
 
-Grab `fullscreen-web.apk` from [Releases](releases/latest), then either:
+## Build
 
-```bash
-adb install -r fullscreen-web.apk
-```
-
-or copy it to the device and open it with a file manager (you will need to allow
-"install unknown apps" for that file manager). Some MIUI/HyperOS builds refuse
-`adb install` with `INSTALL_FAILED_USER_RESTRICTED` and show no dialog — tapping
-the APK in Files works.
-
-## First run
-
-With no address known, the app shows a **Start page** dialog prefilled from
-`res/values/strings.xml` → `default_url` (a placeholder, `https://www.google.com/`).
-What you confirm is stored in `SharedPreferences` (`settings` / `start_url`) and
-reused silently from then on. Bare hosts get `http://` prepended.
-
-Address precedence, first match wins:
-
-1. `url` string extra on the intent
-2. `ACTION_VIEW` intent data (`http://…`)
-3. the stored value
-4. the setup dialog (only if none of the above)
-
-To change the start page: **clear the app's data** (Settings → Apps → Fullscreen
-Web → Storage → Clear data), or launch it once from Kodi with the new URL and no
-stored value set.
-
-## Launch from Kodi
-
-The app must be installed on the **same device** as Kodi. Add as a favourite, or
-use it in a keymap / `.strm` / `playercorefactory.xml`:
-
-```
-StartAndroidActivity(com.vitaly.webfullscreen,android.intent.action.VIEW,,http://192.168.1.10:8080/)
-```
-
-Parameter order is
-`package, action, dataType, dataURI, flags, extras, action, category, className`
-(params 5–9 are Kodi 20+ only). `dataType` is empty, hence the `,,`.
-
-Or pass the address as an extra instead of the URI:
-
-```
-StartAndroidActivity(com.vitaly.webfullscreen,android.intent.action.MAIN,,,,"url=http://192.168.1.10:8080/")
-```
-
-Test it without Kodi, from a PC with adb:
+Requirements: JDK 17+, Android SDK with **platform 37.2** and **build-tools 37.0.0**,
+Gradle 9.x.
 
 ```bash
-adb shell am start -a android.intent.action.VIEW \
-  -d http://192.168.1.10:8080/ com.vitaly.webfullscreen
+export ANDROID_HOME=/path/to/android-sdk
+./build.sh                                # universal APK (arm64-v8a + armeabi-v7a)
+./build.sh assembleDebug
 ```
 
-**Remotes without a back key** (some TV boxes map only `KEYCODE_ESCAPE`): bind it
-in Kodi or add a keyboard remap; the app listens for `KEYCODE_BACK` specifically.
-
-## Build from source
-
-Requirements: JDK 17+ and Android SDK **build-tools 34.0.0** + **platform 34**
-(`ANDROID_HOME` or `ANDROID_SDK_ROOT` pointing at the SDK).
+or directly:
 
 ```bash
-ANDROID_HOME=~/Android/Sdk ./build.sh
+gradle assembleRelease                       # universal, both ABIs
+gradle -Pabis=arm64-v8a assembleRelease      # single ABI, roughly half the size
 ```
 
-The build is plain SDK tooling, no Gradle: `aapt2 compile` → `aapt2 link` →
-`javac` → `d8` → `zip` → `zipalign` → `apksigner`. Output: `fullscreen-web.apk`.
+Output: `build/outputs/apk/release/fullscreen-web-release.apk`.
 
-`build.sh` generates `keystore/debug.keystore` on first run (password `android`).
-**Keep that file** — it is gitignored on purpose, and the same key is what lets a
-new build install *over* the old one. Lose it and you must uninstall first,
-wiping the saved start page.
+Traps worth knowing if you rebuild this:
 
-## Repository layout
+* `settings.gradle` adds `https://maven.mozilla.org/maven2/` — GeckoView is published
+  there, not on Maven Central.
+* Use the **omni** artifact `org.mozilla.geckoview:geckoview`. The per-ABI artifacts
+  cannot be combined: both declare the capability `org.mozilla.geckoview:geckoview` and
+  Gradle fails resolution with a capability conflict.
+* `compileSdk 37` **plus** `compileSdkMinor 2`. `compileSdk 37` alone fails with
+  "AAR metadata requires compileSdk 37.2".
+* The manifest must **not** contain `<uses-sdk>`: AGP 9 rejects it; SDK levels come from
+  the DSL.
+* The source tree is hand-rolled (`AndroidManifest.xml`, `src/`, `res/` at the repo root,
+  no `app/` module) and `build.gradle` maps it through `sourceSets`.
+
+## Signing
+
+Release builds are signed with `keystore/debug.keystore` (alias `debug`) — the same key
+as every 1.x release. That is deliberate: same package plus same certificate means the
+APK installs **over** an existing installation, so the stored start URL and the Kodi
+launcher shortcut survive the upgrade. A new key would force an uninstall.
+
+## Install on the TV
+
+The target device has no wireless debugging and is not reachable over `adb`, so:
+
+1. Copy the APK from the file share (`\\192.168.200.11\torrent-data`) to a USB stick.
+2. Install it from a file manager on the TV (allow "install unknown apps" for it), or
+   download it on the TV itself and tap it.
+3. Launch once and confirm the page renders. Kodi starts the app by package name, so no
+   shortcut needs to be recreated.
+
+The 1.x APK installs over 2.0 the same way, in reverse, if you need to roll back.
+
+## Size and storage
+
+| Variant | APK | Installed footprint (approx.) |
+| --- | --- | --- |
+| universal (arm64-v8a + armeabi-v7a) | 161 MB | ~320 MB |
+| arm64-v8a only | 92 MB | ~180 MB |
+
+Native libraries are extracted on install (`extractNativeLibs=true`), so the installed
+footprint is roughly twice the APK size. On a box with little free space use the
+arm64-only build — but it installs only on a 64-bit device and is rejected on a 32-bit
+one.
+
+## Known limits
+
+* **Audible autoplay is blocked** until the page has had one user interaction. GeckoView
+  has no equivalent of WebView's `setMediaPlaybackRequiresUserGesture(false)`; muted
+  autoplay works. An unattended dashboard that plays sound needs one remote key press.
+* **Rendering differs from Chrome** by design — different engine, different font
+  rasterisation. That is the price of an engine that still gets updates.
+* **No in-app UI whatsoever** — no zoom, no reload, no address entry after first run.
+  To change the start URL, clear app data or send a new intent.
+* **Not verified on the target device.** Build, packaging, manifest merge, signing and
+  dex contents are verified on the build host. Runtime behaviour could not be tested
+  there: no KVM for an emulator, no `adb` to the TV.
+
+## Layout
 
 ```
-AndroidManifest.xml   package, permissions, activity + intent filters
-build.sh              the whole build (bash + SDK tools)
-src/com/vitaly/webfullscreen/MainActivity.java   the single activity
-res/values/strings.xml      app strings, default_url placeholder
-res/mipmap-*/               launcher icon (generated, see below)
-tools/make_icons.py         regenerates the icon set
-tools/icon-source.png       icon artwork
+AndroidManifest.xml          single activity, launcher + VIEW intent filters
+build.gradle                 AGP 9, GeckoView, abiFilters, signing
+settings.gradle              repositories incl. maven.mozilla.org
+gradle.properties            AndroidX, JVM args
+build.sh                     thin Gradle wrapper
+src/com/vitaly/webfullscreen/MainActivity.java
+res/                         strings, colors, launcher icon
+keystore/debug.keystore      the 1.x signing key — do not regenerate
+dist/                        built APKs for sideloading
+tools/                       helper scripts
 ```
-
-## Icon
-
-`tools/make_icons.py` trims `tools/icon-source.png` to its ink bounding box and
-regenerates every density, plus a 108 dp adaptive foreground:
-
-```bash
-python3 tools/make_icons.py            # needs Pillow
-```
-
-Sizing matters more than it looks. The mark's petals bulge to all four sides, so
-its extremes sit on the diagonals: content occupying fraction `f` of the canvas
-reaches `f/2*sqrt(2)` from the centre. An adaptive icon only shows a 72 dp circle
-inside its 108 dp canvas, so `f` must stay under ≈0.47 or launcher masks shave the
-tips. The script uses 0.44 for the adaptive foreground and 0.66 for legacy
-bitmaps.
-
-## Notes and limits
-
-- The package id is `com.vitaly.webfullscreen` and stays that way so upgrades
-  install in place. Forking? Change it in `AndroidManifest.xml`.
-- `usesCleartextTraffic="true"` and the exported `http`/`https` `VIEW` filter mean
-  any app can ask it to open a page. It is a viewer with `INTERNET` only — no
-  file access, no storage, no injected JS bridges.
-- No error page, only a toast; a dead host leaves the previous page or a blank
-  screen behind.
-- No `shouldOverrideUrlLoading` override, so navigation stays in the same WebView
-  and fullscreen survives it.
-- `allowBackup="false"`, so the stored URL does not travel to a new device.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The icon artwork in `tools/icon-source.png` is
-third-party-looking; it ships here as-is, check its origin before reusing it.
+See [LICENSE](LICENSE).

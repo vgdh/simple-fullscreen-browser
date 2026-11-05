@@ -1,6 +1,5 @@
 package com.vitaly.webfullscreen;
 
-import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.DialogInterface;
@@ -15,16 +14,26 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
-import android.webkit.WebChromeClient;
-import android.webkit.WebSettings;
-import android.webkit.WebView;
-import android.webkit.WebViewClient;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.Toast;
 
+import org.mozilla.geckoview.GeckoResult;
+import org.mozilla.geckoview.GeckoRuntime;
+import org.mozilla.geckoview.GeckoRuntimeSettings;
+import org.mozilla.geckoview.GeckoSession;
+import org.mozilla.geckoview.GeckoSessionSettings;
+import org.mozilla.geckoview.GeckoView;
+import org.mozilla.geckoview.WebRequestError;
+
 /**
- * Fullscreen WebView wrapper for Kodi.
+ * Fullscreen kiosk browser for Kodi, powered by a bundled GeckoView engine.
+ *
+ * Why not android.webkit.WebView: the engine then belongs to the device
+ * firmware. On this TV that firmware is Chromium 85, which silently discards
+ * any stylesheet wrapped in @layer (Chrome 99+) — modern sites render as
+ * unstyled text. GeckoView ships the engine inside the APK, so the rendering
+ * version no longer depends on what the vendor shipped years ago.
  *
  * URL resolution order:
  *   1. the launching intent (ACTION_VIEW data, or string extra "url") —
@@ -44,75 +53,159 @@ public class MainActivity extends Activity {
     private static final String PREFS = "settings";
     private static final String KEY_URL = "start_url";
 
-    private WebView web;
+    private GeckoRuntime runtime;
+    private GeckoSession session;
+    private GeckoView view;
     private FrameLayout root;
-    private View customView;
-    private WebChromeClient.CustomViewCallback customViewCallback;
 
-    private class ChromeClient extends WebChromeClient {
-        @Override
-        public void onShowCustomView(View view, CustomViewCallback callback) {
-            if (customView != null) {
-                callback.onCustomViewHidden();
-                return;
-            }
-            customView = view;
-            customViewCallback = callback;
-            root.addView(customView, new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT));
-            web.setVisibility(View.GONE);
-            enterImmersive();
-        }
+    /** Kept up to date by NavigationDelegate; 159 dropped getSessionHistory(). */
+    private boolean canGoBack;
 
-        @Override
-        public void onHideCustomView() {
-            hideCustomView();
-        }
-    }
+    // ---------------------------------------------------------------- lifecycle
 
-    private final ChromeClient chromeClient = new ChromeClient();
-
-    @SuppressLint("SetJavaScriptEnabled")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
         root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
 
-        web = new WebView(this);
-        web.setBackgroundColor(Color.BLACK);
-        root.addView(web, new FrameLayout.LayoutParams(
+        view = new GeckoView(this);
+        view.setBackgroundColor(Color.BLACK);
+        root.addView(view, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
         setContentView(root);
 
-        WebSettings s = web.getSettings();
-        s.setJavaScriptEnabled(true);
-        s.setDomStorageEnabled(true);
-        s.setLoadWithOverviewMode(true);
-        s.setUseWideViewPort(true);
-        s.setMediaPlaybackRequiresUserGesture(false);
-        s.setAllowFileAccess(true);
-        s.setCacheMode(WebSettings.LOAD_DEFAULT);
+        GeckoRuntimeSettings rtSettings = new GeckoRuntimeSettings.Builder()
+                // Lets you attach Firefox desktop via about:debugging over USB,
+                // which is the only practical way to inspect this TV remotely.
+                // Harmless when unused: it opens no port and shows no UI.
+                .remoteDebuggingEnabled(true)
+                .aboutConfigEnabled(true)
+                // Remote page console -> logcat (adb logcat -s GeckoView).
+                .consoleOutput(false)
+                .build();
+        runtime = GeckoRuntime.create(this, rtSettings);
 
-        web.setWebViewClient(new WebViewClient() {
-            @SuppressWarnings("deprecation")
-            @Override
-            public void onReceivedError(WebView view, int errorCode,
-                                        String description, String failingUrl) {
-                Toast.makeText(MainActivity.this,
-                        getString(R.string.load_failed, description),
-                        Toast.LENGTH_LONG).show();
-            }
-        });
-        web.setWebChromeClient(chromeClient);
+        GeckoSessionSettings sessionSettings = new GeckoSessionSettings.Builder()
+                // Desktop UA + desktop viewport: the TV is a big fixed screen,
+                // so it should get the desktop layout, not a phone layout.
+                .userAgentMode(GeckoSessionSettings.USER_AGENT_MODE_DESKTOP)
+                .viewportMode(GeckoSessionSettings.VIEWPORT_MODE_DESKTOP)
+                // No browser chrome exists here, so viewport units must be
+                // measured against the whole screen (100vh == screen height).
+                .displayMode(GeckoSessionSettings.DISPLAY_MODE_FULLSCREEN)
+                .allowJavascript(true)
+                .build();
+
+        session = new GeckoSession(sessionSettings);
+        session.setProgressDelegate(new ProgressDelegate());
+        session.setNavigationDelegate(new NavigationDelegate());
+        session.setContentDelegate(new ContentDelegate());
+        session.open(runtime);
+        view.setSession(session);
+        view.setFocusable(true);
+        view.requestFocus();
 
         enterImmersive();
         startWithIntentOrSaved(getIntent());
     }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        String url = urlFrom(intent);
+        if (url != null) {
+            if (storedUrl() == null) persist(url);
+            load(url);
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        if (session != null) session.setActive(false);
+        super.onPause();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (session != null) {
+            session.setActive(true);
+            session.setFocused(true);
+        }
+        enterImmersive();
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (view != null) view.releaseSession();
+        if (session != null) {
+            session.close();
+            session = null;
+        }
+        super.onDestroy();
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            enterImmersive();
+            if (view != null) view.requestFocus();
+        }
+    }
+
+    // ---------------------------------------------------------------- delegates
+
+    private class ProgressDelegate implements GeckoSession.ProgressDelegate {
+        @Override
+        public void onPageStop(GeckoSession s, boolean success) {
+            // Gecko paints its own progress; we only care about restoring the
+            // immersive bars, which video fullscreen can knock out.
+            enterImmersive();
+        }
+    }
+
+    private class NavigationDelegate implements GeckoSession.NavigationDelegate {
+        @Override
+        public void onCanGoBack(GeckoSession s, boolean value) {
+            canGoBack = value;
+        }
+
+        @Override
+        public GeckoResult<String> onLoadError(GeckoSession s, String uri,
+                                               WebRequestError error) {
+            Toast.makeText(MainActivity.this,
+                    getString(R.string.load_failed, uri),
+                    Toast.LENGTH_LONG).show();
+            // null = no built-in error page: keep the black background rather
+            // than a Chrome-style "no internet" page on a kiosk screen.
+            return null;
+        }
+    }
+
+    private class ContentDelegate implements GeckoSession.ContentDelegate {
+        @Override
+        public void onFullScreen(GeckoSession s, boolean fullScreen) {
+            // The activity is already fullscreen; HTML5 fullscreen only needs
+            // the system bars re-hidden once the player takes over the view.
+            enterImmersive();
+        }
+
+        @Override
+        public void onTitleChange(GeckoSession s, String title) {
+            // No title bar is drawn, but keeping it costs nothing and makes
+            // "recent apps" on the TV readable.
+            if (title != null && title.length() > 0) setTitle(title);
+        }
+    }
+
+    // ---------------------------------------------------------------- url logic
 
     private void startWithIntentOrSaved(Intent intent) {
         String url = urlFrom(intent);
@@ -132,7 +225,7 @@ public class MainActivity extends Activity {
     }
 
     private void load(String url) {
-        web.loadUrl(url);
+        if (session != null) session.loadUri(url);
         enterImmersive();
     }
 
@@ -149,6 +242,13 @@ public class MainActivity extends Activity {
 
     private SharedPreferences prefs() {
         return getSharedPreferences(PREFS, MODE_PRIVATE);
+    }
+
+    private static String urlFrom(Intent intent) {
+        if (intent == null) return null;
+        String extra = intent.getStringExtra(EXTRA_URL);
+        if (extra != null && extra.trim().length() > 0) return extra.trim();
+        return intent.getDataString();
     }
 
     /** Ask once for the start page. Cancel = nothing to show, so exit. */
@@ -225,25 +325,8 @@ public class MainActivity extends Activity {
         return u;
     }
 
-    @Override
-    protected void onNewIntent(Intent intent) {
-        super.onNewIntent(intent);
-        setIntent(intent);
-        String url = urlFrom(intent);
-        if (url != null) {
-            if (storedUrl() == null) persist(url);
-            load(url);
-        }
-    }
+    // ---------------------------------------------------------------- chrome
 
-    private static String urlFrom(Intent intent) {
-        if (intent == null) return null;
-        String extra = intent.getStringExtra(EXTRA_URL);
-        if (extra != null && extra.trim().length() > 0) return extra.trim();
-        return intent.getDataString();
-    }
-
-    @SuppressWarnings("deprecation")
     private void enterImmersive() {
         if (Build.VERSION.SDK_INT >= 30) {
             getWindow().setDecorFitsSystemWindows(false);
@@ -264,25 +347,10 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void hideCustomView() {
-        if (customView == null) return;
-        root.removeView(customView);
-        customView = null;
-        web.setVisibility(View.VISIBLE);
-        if (customViewCallback != null) {
-            customViewCallback.onCustomViewHidden();
-            customViewCallback = null;
-        }
-    }
-
     /** Back: page history first, then exit to whoever launched us. */
     private void handleBack() {
-        if (customView != null) {
-            hideCustomView();
-            return;
-        }
-        if (web != null && web.canGoBack()) {
-            web.goBack();
+        if (session != null && canGoBack) {
+            session.goBack();
             return;
         }
         finish();
@@ -302,40 +370,5 @@ public class MainActivity extends Activity {
             return true;
         }
         return super.onKeyDown(keyCode, event);
-    }
-
-    @Override
-    public void onWindowFocusChanged(boolean hasFocus) {
-        super.onWindowFocusChanged(hasFocus);
-        if (hasFocus) enterImmersive();
-    }
-
-    @Override
-    protected void onPause() {
-        super.onPause();
-        if (web != null) {
-            web.onPause();
-            web.pauseTimers();
-        }
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-        if (web != null) {
-            web.resumeTimers();
-            web.onResume();
-        }
-        enterImmersive();
-    }
-
-    @Override
-    protected void onDestroy() {
-        if (web != null) {
-            root.removeView(web);
-            web.destroy();
-            web = null;
-        }
-        super.onDestroy();
     }
 }
