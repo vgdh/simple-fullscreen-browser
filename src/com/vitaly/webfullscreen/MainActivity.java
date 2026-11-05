@@ -308,7 +308,7 @@ public class MainActivity extends Activity {
         pageLoaded = false;
         painted = false;
         repaintRetryDone = false;
-        if (url != null) load(url);
+        if (url != null) loadWhenReady(url);
     }
 
     /** Return the process-wide runtime, creating it on first use only. */
@@ -494,23 +494,33 @@ public class MainActivity extends Activity {
      */
     private void loadWhenReady(String url) {
         if (url == null || session == null) return;
-        if (session.isOpen()) {
+        if (isReadyToLoad()) {
             load(url);
             return;
         }
-        diag("waiting for session open");
+        diag("waiting for session open/attach");
         awaitOpen(url, 0);
+    }
+
+    /**
+     * A load is only honoured when the session is open AND the GeckoView is
+     * attached to the window. Issuing it before either is the white screen:
+     * the engine drops it and never reports page-start.
+     */
+    private boolean isReadyToLoad() {
+        return session != null && session.isOpen()
+                && (view == null || view.isAttachedToWindow());
     }
 
     private void awaitOpen(String url, int attempt) {
         if (isFinishing() || session == null) return;
-        if (session.isOpen()) {
-            diag("session open after " + (attempt * 50) + "ms");
+        if (isReadyToLoad()) {
+            diag("ready after " + (attempt * 50) + "ms");
             load(url);
             return;
         }
-        if (attempt >= 40) {          // 2s is long enough for open() on any TV box
-            diag("session never opened, loading anyway");
+        if (attempt >= 60) {          // 3s: open + window attach on any TV box
+            diag("never ready, loading anyway");
             load(url);
             return;
         }
@@ -586,6 +596,18 @@ public class MainActivity extends Activity {
 
     private void load(String url) {
         if (session == null) return;
+        // A GeckoSession only processes a load while it is attached to a view and
+        // active. Otherwise loadUri() is accepted and silently discarded: no
+        // page-start, no page-stop, white screen for ever. This is that case.
+        if (view != null && view.getSession() != session) {
+            diag("session not attached, re-attaching");
+            view.setSession(session);
+        }
+        if (view != null && !view.isAttachedToWindow()) {
+            diag("view not attached to window");
+        }
+        session.setActive(true);
+        session.setFocused(true);
         targetUrl = url;
         pageLoaded = false;
         painted = false;
@@ -648,7 +670,7 @@ public class MainActivity extends Activity {
             if (isFinishing() || session == null || pageLoaded) return;
             if (!isBlankUri(currentUri)) return;      // it recovered on its own
             retryCount = Math.max(retryCount, 1);     // second attempt bypasses cache
-            load(targetUrl);
+            loadWhenReady(targetUrl);                 // the attach gate may not hold yet
         }, 2000);
     }
 
@@ -661,7 +683,7 @@ public class MainActivity extends Activity {
         retryCount++;
         diag("retry " + retryCount + "/" + MAX_RETRY + " in 3s");
         mainHandler.postDelayed(() -> {
-            if (!pageLoaded) load(targetUrl);
+            if (!pageLoaded) loadWhenReady(targetUrl);
         }, 3000);
     }
 
@@ -819,8 +841,11 @@ public class MainActivity extends Activity {
         // Exit once we are on the start page again, instead of walking the
         // whole session history: a failed navigation leaves its own entry, so
         // "canGoBack" alone can stay true forever and BACK never exits.
-        boolean offStart = currentUri != null && targetUrl != null
-                && !samePage(currentUri, targetUrl);
+        // A blank/errored document is not "off the start page": comparing
+        // about:blank with the target made BACK re-issue a load the engine was
+        // dropping, so BACK appeared dead exactly while the retries ran.
+        boolean offStart = !isBlankUri(currentUri) && currentUri != null
+                && targetUrl != null && !samePage(currentUri, targetUrl);
         // Never goBack() to the dashboard: a history restore can hand back the
         // document with its bundle unexecuted, or land on the error entry that a
         // failed card left behind. A plain load is the path startup already
