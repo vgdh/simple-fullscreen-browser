@@ -13,6 +13,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
 import android.util.Log;
+import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -20,6 +21,7 @@ import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import org.mozilla.geckoview.GeckoResult;
@@ -60,7 +62,10 @@ public class MainActivity extends Activity {
 
     /** One-time profile wipe marker: bump the tag to wipe once on next launch. */
     private static final String KEY_WIPE = "wipe_tag";
-    private static final String WIPE_TAG = "2.4";
+    private static final String WIPE_TAG = "2.5";
+
+    /** Show a one-line boot state on screen: no console exists on the TV. */
+    private static final boolean BOOT_DIAG = true;
 
     /** Diagnostic phase: show on screen which BACK branch ran and which build
      *  is actually installed. Flip to false once the behaviour is confirmed. */
@@ -98,6 +103,21 @@ public class MainActivity extends Activity {
     /** Guards against BACK being dispatched twice (onKeyDown + onBackPressed). */
     private boolean exiting;
 
+    /** Last committed location, fed by onLocationChange (159 has no getCurrentUri). */
+    private String currentUri;
+
+    /** URL the last load() asked for; compared against currentUri for BACK. */
+    private String targetUrl;
+
+    /** Retried once already after a load that never reported onPageStop. */
+    private boolean retried;
+
+    /** Pending "did the page actually arrive" check. */
+    private Runnable loadWatchdog;
+
+    private TextView diagView;
+    private String label = "?";
+
     // ---------------------------------------------------------------- lifecycle
 
     @Override
@@ -114,7 +134,19 @@ public class MainActivity extends Activity {
         root.addView(view, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
-        setContentView(root);
+        if (BOOT_DIAG) {
+            diagView = new TextView(this);
+            diagView.setTextColor(Color.WHITE);
+            diagView.setTextSize(11f);
+            diagView.setPadding(12, 8, 12, 8);
+            diagView.setBackgroundColor(0x99000000);
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.gravity = Gravity.TOP | Gravity.START;
+            root.addView(diagView, lp);
+        }
+        label = buildLabel();
 
         GeckoRuntimeSettings rtSettings = new GeckoRuntimeSettings.Builder()
                 // Lets you attach Firefox desktop via about:debugging over USB,
@@ -148,6 +180,7 @@ public class MainActivity extends Activity {
         view.requestFocus();
 
         enterImmersive();
+        diag("created, runtime=" + (runtime != null));
         startWithIntentOrSaved(getIntent());
     }
 
@@ -236,6 +269,11 @@ public class MainActivity extends Activity {
             // Gecko paints its own progress; we only care about restoring the
             // immersive bars, which video fullscreen can knock out.
             pageLoaded = true;
+            if (loadWatchdog != null) {
+                mainHandler.removeCallbacks(loadWatchdog);
+                loadWatchdog = null;
+            }
+            diag("page-stop success=" + success + " " + shortUri(currentUri));
             enterImmersive();
         }
     }
@@ -249,12 +287,27 @@ public class MainActivity extends Activity {
         @Override
         public GeckoResult<String> onLoadError(GeckoSession s, String uri,
                                                WebRequestError error) {
-            Toast.makeText(MainActivity.this,
-                    getString(R.string.load_failed, uri),
-                    Toast.LENGTH_LONG).show();
-            // null = no built-in error page: keep the black background rather
-            // than a Chrome-style "no internet" page on a kiosk screen.
-            return null;
+            String code = "code=" + error.code + " cat=" + error.category;
+            diag("load-error " + code + " " + shortUri(uri));
+            // Returning null shows GeckoView's own Chrome-style error page, which
+            // on a kiosk reads as a broken app. Draw our own instead: black
+            // background, the failing address and the real Gecko code.
+            return GeckoResult.fromValue(
+                    "<html><body style='margin:0;background:#000;color:#ddd;"
+                            + "font:16px/1.5 monospace;padding:40px'>"
+                            + "<div style='font-size:22px;color:#fff'>Page did not load</div>"
+                            + "<p>" + escape(uri) + "</p><p style='color:#f0a020'>"
+                            + escape(code) + "</p>"
+                            + "<p style='color:#888'>BACK returns to the dashboard.</p>"
+                            + "</body></html>");
+        }
+
+        @Override
+        public void onLocationChange(GeckoSession s, String url,
+                                     java.util.List<GeckoSession.PermissionDelegate.ContentPermission> perms,
+                                     Boolean hasUserGesture) {
+            currentUri = url;
+            diag("location " + shortUri(url));
         }
     }
 
@@ -307,6 +360,11 @@ public class MainActivity extends Activity {
             return;
         }
 
+        // Clear the marker *before* wiping: clearData can fail or hang, and a
+        // marker written only on success made the wipe repeat on every launch,
+        // which is what turns a slow first paint into a permanent white screen.
+        prefs().edit().putString(KEY_WIPE, WIPE_TAG).apply();
+
         // clearData is async and this gates the first page load, so a callback
         // that never arrives would leave a black screen with no way back. Load
         // anyway after a short grace period; whichever path fires first wins.
@@ -318,20 +376,20 @@ public class MainActivity extends Activity {
         };
 
         Log.i(TAG, "profile wipe for " + WIPE_TAG);
+        diag("profile wipe");
         try {
             runtime.getStorageController()
                     .clearData(StorageController.ClearFlags.ALL)
                     .accept(
                             ignored -> {
                                 Log.i(TAG, "profile wiped");
-                                prefs().edit().putString(KEY_WIPE, WIPE_TAG).apply();
                                 go.run();
                             },
                             err -> {
                                 Log.w(TAG, "profile wipe failed: " + err);
                                 go.run();
                             });
-            mainHandler.postDelayed(go, 4000);
+            mainHandler.postDelayed(go, 1500);
         } catch (Throwable t) {
             Log.w(TAG, "profile wipe unavailable: " + t);
             go.run();
@@ -339,8 +397,56 @@ public class MainActivity extends Activity {
     }
 
     private void load(String url) {
-        if (session != null) session.loadUri(url);
+        if (session == null) return;
+        targetUrl = url;
+        retried = false;
+        pageLoaded = false;
+        diag("load " + shortUri(url));
+        session.loadUri(url);
+        armLoadWatchdog();
         enterImmersive();
+    }
+
+    /**
+     * A load that never reports onPageStop leaves an endless black screen and no
+     * way to tell whether the engine, the network or the URL is at fault. Check
+     * after 8s; if the page never arrived, re-issue it once with the HTTP cache
+     * bypassed, then say so on screen instead of staying silent.
+     */
+    private void armLoadWatchdog() {
+        if (loadWatchdog != null) mainHandler.removeCallbacks(loadWatchdog);
+        loadWatchdog = () -> {
+            loadWatchdog = null;
+            if (pageLoaded || isFinishing() || session == null) return;
+            if (!retried && targetUrl != null) {
+                retried = true;
+                diag("no page-stop after 8s, retrying");
+                session.load(new GeckoSession.Loader()
+                        .uri(targetUrl)
+                        .flags(GeckoSession.LOAD_FLAGS_BYPASS_CACHE));
+                armLoadWatchdog();
+            } else {
+                diag("still blank: " + shortUri(targetUrl));
+            }
+        };
+        mainHandler.postDelayed(loadWatchdog, 8000);
+    }
+
+    /** One-line boot state in the corner. Costs nothing when BOOT_DIAG is off. */
+    private void diag(String msg) {
+        Log.i(TAG, "diag: " + msg);
+        if (!BOOT_DIAG || diagView == null) return;
+        diagView.setText(label + "\n" + msg);
+    }
+
+    private static String shortUri(String uri) {
+        if (uri == null) return "(none)";
+        return uri.length() > 48 ? uri.substring(0, 48) + "…" : uri;
+    }
+
+    private static String escape(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
 
     private String storedUrl() {
@@ -464,9 +570,17 @@ public class MainActivity extends Activity {
     /** Back: page history first, then exit to whoever launched us. */
     private void handleBack() {
         if (exiting) return;              // onKeyDown and onBackPressed both fire on some builds
-        boolean history = (session != null && canGoBack);
+
+        // Exit once we are on the start page again, instead of walking the
+        // whole session history: a failed navigation leaves its own entry, so
+        // "canGoBack" alone can stay true forever and BACK never exits.
+        boolean offStart = currentUri != null && targetUrl != null
+                && !samePage(currentUri, targetUrl);
+        boolean history = offStart && session != null && canGoBack;
         String what = history ? "goBack (page history)" : "exitApp";
-        Log.i(TAG, "BACK canGoBack=" + canGoBack + " -> " + what + " build=" + buildLabel());
+        Log.i(TAG, "BACK canGoBack=" + canGoBack + " offStart=" + offStart
+                + " -> " + what + " build=" + label);
+        diag("BACK offStart=" + offStart + " -> " + what);
         if (BACK_DIAGNOSTIC) {
             Toast.makeText(this, "BACK -> " + what + "\n" + buildLabel(),
                     Toast.LENGTH_LONG).show();
@@ -476,6 +590,21 @@ public class MainActivity extends Activity {
             return;
         }
         exitApp();
+    }
+
+    /** Same document? Trailing slash and empty path must not count as a change. */
+    private static boolean samePage(String a, String b) {
+        return trimSlash(a).equals(trimSlash(b));
+    }
+
+    private static String trimSlash(String u) {
+        if (u == null) return "";
+        int q = u.indexOf('?');
+        String base = q >= 0 ? u.substring(0, q) : u;
+        while (base.endsWith("/") && base.length() > 1) {
+            base = base.substring(0, base.length() - 1);
+        }
+        return base;
     }
 
     /** versionName (versionCode) of the package that is actually installed. */
