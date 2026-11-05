@@ -12,6 +12,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.net.ConnectivityManager;
 import android.os.Looper;
+import android.os.Process;
 import android.os.SystemClock;
 import android.text.InputType;
 import android.util.Log;
@@ -115,11 +116,21 @@ public class MainActivity extends Activity {
     /** Two deliberate presses inside this window mean "yes, leave the kiosk". */
     private static final long EXIT_CONFIRM_MS = 2500;
 
+    /** How many times a swallowed load may be re-issued before giving up quietly. */
+    private static final int MAX_BLANK_LOADS = 4;
+
     private long lastBackAt;
     private long exitArmedAt;
 
     /** Consecutive commits of the engine's own about:blank; 3 strikes then idle. */
     private int blankLoads;
+
+    /** A spaced blank-retry is already queued; blank page-stops must not stack. */
+    private boolean blankRetryPending;
+
+    /** Marks the live activity so a pending exit-kill cannot hit a fresh launch. */
+    private static MainActivity activeActivity;
+    private static long exitStamp;
 
     /** Last committed location, fed by onLocationChange (159 has no getCurrentUri). */
     private String currentUri;
@@ -150,6 +161,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        activeActivity = this;
 
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
@@ -274,6 +286,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (activeActivity == this) activeActivity = null;
         if (view != null) view.releaseSession();
         if (session != null) {
             session.close();
@@ -298,27 +311,27 @@ public class MainActivity extends Activity {
         public void onPageStop(GeckoSession s, boolean success) {
             // Gecko paints its own progress; we only care about restoring the
             // immersive bars, which video fullscreen can knock out.
-            if (loadWatchdog != null) {
-                mainHandler.removeCallbacks(loadWatchdog);
-                loadWatchdog = null;
-            }
             diag("page-stop success=" + success + " painted=" + painted
                     + " " + shortUri(currentUri));
 
             // The engine can commit its own initial about:blank and silently drop
             // the load we issued. Every later "success" then refers to that blank
-            // document, so the screen stays white for ever -- re-issue the load.
+            // document, so the screen stays white for ever -- re-issue the load,
+            // but spaced out: firing three loads back to back makes each one
+            // cancel the previous, which is how a blank screen becomes permanent.
             if (isBlankUri(currentUri) && targetUrl != null && !isBlankUri(targetUrl)) {
                 pageLoaded = false;
-                if (blankLoads < 3) {
-                    blankLoads++;
-                    diag("blank document, loading again " + blankLoads + "/3");
-                    mainHandler.post(() -> { if (session != null) load(targetUrl); });
-                } else {
-                    diag("stuck on about:blank");
-                }
+                diag("blank document, retrying in 2s");
+                scheduleBlankRetry();
                 enterImmersive();
                 return;
+            }
+
+            // Only a real document disarms the watchdog; a stale about:blank
+            // page-stop used to cancel it and leave the window white for ever.
+            if (loadWatchdog != null) {
+                mainHandler.removeCallbacks(loadWatchdog);
+                loadWatchdog = null;
             }
             blankLoads = 0;
 
@@ -563,6 +576,25 @@ public class MainActivity extends Activity {
      * on that error page until someone restarts the app. Keep trying until a
      * page actually arrives.
      */
+    /** Re-issue a load the engine swallowed, spaced so loads do not cancel each other. */
+    private void scheduleBlankRetry() {
+        if (blankRetryPending || targetUrl == null) return;
+        if (blankLoads >= MAX_BLANK_LOADS) {
+            diag("still about:blank after " + MAX_BLANK_LOADS + " loads");
+            return;
+        }
+        blankLoads++;
+        blankRetryPending = true;
+        diag("re-issue " + blankLoads + "/" + MAX_BLANK_LOADS + " in 2s");
+        mainHandler.postDelayed(() -> {
+            blankRetryPending = false;
+            if (isFinishing() || session == null || pageLoaded) return;
+            if (!isBlankUri(currentUri)) return;      // it recovered on its own
+            retryCount = Math.max(retryCount, 1);     // second attempt bypasses cache
+            load(targetUrl);
+        }, 2000);
+    }
+
     private void scheduleRetry() {
         if (session == null || isFinishing() || targetUrl == null) return;
         if (retryCount >= MAX_RETRY) {
@@ -797,13 +829,31 @@ public class MainActivity extends Activity {
      */
     private void exitApp() {
         exiting = true;
-        Log.i(TAG, "exitApp: finishAndRemoveTask(), task id " + getTaskId());
-        if (Build.VERSION.SDK_INT >= 21) {
-            finishAndRemoveTask();
-            Log.i(TAG, "exitApp: isFinishing=" + isFinishing());
-        } else {
-            finish();
+        Log.i(TAG, "exitApp: shutdown runtime, remove task, kill process");
+        // finishAndRemoveTask() only kills the task. The process stays cached
+        // because a static GeckoRuntime plus its child processes keep it alive,
+        // which is why "Force stop" is still offered afterwards -- and why the
+        // next launch can inherit a runtime whose session state is stale (the
+        // intermittent blank screen). Shut Gecko down, then end the process.
+        if (session != null) {
+            try { session.close(); } catch (Throwable ignored) { }
+            session = null;
         }
+        if (Build.VERSION.SDK_INT >= 21) finishAndRemoveTask();
+        else finish();
+        final long stamp = ++exitStamp;
+        mainHandler.postDelayed(() -> {
+            // A relaunch inside this window keeps the runtime alive: shutting it
+            // down here would leave a dead runtime for the new activity.
+            if (stamp != exitStamp || activeActivity != null) return;
+            try {
+                if (sRuntime != null) sRuntime.shutdown();
+            } catch (Throwable t) {
+                Log.i(TAG, "exitApp: runtime shutdown threw " + t);
+            }
+            sRuntime = null;
+            Process.killProcess(Process.myPid());
+        }, 1200);
     }
 
     @Override
