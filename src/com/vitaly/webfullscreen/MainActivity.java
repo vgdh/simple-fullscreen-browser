@@ -81,6 +81,8 @@ public class MainActivity extends Activity {
 
     /** Lines kept on screen; attempts before the loader gives up. */
     private static final int DIAG_LINES = 6;
+    /** How long the log lingers after its last line before it hides itself. */
+    private static final long OVERLAY_LINGER_MS = 5000L;
     /** Two attempts, then the kiosk closes itself instead of retrying forever. */
     private static final int MAX_RETRY = 2;
 
@@ -168,6 +170,16 @@ public class MainActivity extends Activity {
 
     private TextView diagView;
     private String label = "?";
+
+    /** The log is a debugging aid, not furniture: it hides itself when quiet. */
+    private boolean overlayHidden;
+    private final Runnable hideOverlay = new Runnable() {
+        @Override
+        public void run() {
+            if (diagView != null) diagView.setVisibility(View.GONE);
+            overlayHidden = true;
+        }
+    };
 
     // ---------------------------------------------------------------- lifecycle
 
@@ -728,6 +740,16 @@ public class MainActivity extends Activity {
         StringBuilder sb = new StringBuilder(label);
         for (String line : diagLog) sb.append('\n').append(line);
         diagView.setText(sb.toString());
+
+        // Any new line resurfaces the log; silence for OVERLAY_LINGER_MS hides it
+        // again, so a healthy kiosk ends up with a clean screen and a fault
+        // leaves the evidence visible for as long as it keeps logging.
+        if (overlayHidden) {
+            diagView.setVisibility(View.VISIBLE);
+            overlayHidden = false;
+        }
+        mainHandler.removeCallbacks(hideOverlay);
+        mainHandler.postDelayed(hideOverlay, OVERLAY_LINGER_MS);
     }
 
     private static String shortUri(String uri) {
