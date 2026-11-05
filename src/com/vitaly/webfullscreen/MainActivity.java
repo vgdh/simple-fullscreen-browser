@@ -62,15 +62,6 @@ public class MainActivity extends Activity {
 
     private static final String PREFS = "settings";
     private static final String KEY_URL = "start_url";
-    /** Timestamp of the last deliberate exit, used to ride out a fast relaunch. */
-    private static final String KEY_LAST_EXIT = "last_exit_at";
-    /**
-     * A relaunch this soon after the exit races the dying process: Gecko is
-     * still reclaiming its profile, so the new session's loads are dropped and
-     * the kiosk closes again. Measured on this box: ~3s of breathing room makes
-     * an immediate relaunch reliable, so the app waits it out itself.
-     */
-    private static final long SETTLE_MS = 6000L;
 
     /** One-time profile wipe marker: bump the tag to wipe once on next launch. */
     private static final String KEY_WIPE = "wipe_tag";
@@ -557,7 +548,7 @@ public class MainActivity extends Activity {
         }
         final String target = url != null ? url : storedUrl();
         clearProfileOnce(() -> {
-            if (target != null) warmUpThenLoad(target);
+            if (target != null) loadWhenReady(target);
             else promptForUrl();
         });
     }
@@ -762,19 +753,6 @@ public class MainActivity extends Activity {
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
 
-    /** Wait out the profile of a just-killed process before demanding a page. */
-    private void warmUpThenLoad(String url) {
-        long lastExit = prefs().getLong(KEY_LAST_EXIT, 0L);
-        long wait = lastExit == 0L ? 0L : SETTLE_MS - (System.currentTimeMillis() - lastExit);
-        if (wait > SETTLE_MS) wait = SETTLE_MS;
-        if (wait > 0L) {
-            diag("recent exit, settling " + wait + "ms");
-            mainHandler.postDelayed(() -> loadWhenReady(url), wait);
-        } else {
-            loadWhenReady(url);
-        }
-    }
-
     private String storedUrl() {
         String v = prefs().getString(KEY_URL, null);
         if (v == null) return null;
@@ -973,7 +951,6 @@ public class MainActivity extends Activity {
      */
     private void exitApp() {
         exiting = true;
-        prefs().edit().putLong(KEY_LAST_EXIT, System.currentTimeMillis()).apply();
         Log.i(TAG, "exitApp: shutdown runtime, remove task, kill process");
         // finishAndRemoveTask() only kills the task. The process stays cached
         // because a static GeckoRuntime plus its child processes keep it alive,
@@ -986,10 +963,12 @@ public class MainActivity extends Activity {
         }
         if (Build.VERSION.SDK_INT >= 21) finishAndRemoveTask();
         else finish();
+        // Kill on the next loop tick, not 1.2s later: the owner wants the app
+        // gone the moment the exit is confirmed. shutdown() is asynchronous, so
+        // an immediate kill leaves Gecko wherever it was -- acceptable for a
+        // kiosk, and the task is already removed by then.
         final long stamp = ++exitStamp;
-        mainHandler.postDelayed(() -> {
-            // A relaunch inside this window keeps the runtime alive: shutting it
-            // down here would leave a dead runtime for the new activity.
+        mainHandler.post(() -> {
             if (stamp != exitStamp || activeActivity != null) return;
             try {
                 if (sRuntime != null) sRuntime.shutdown();
@@ -998,7 +977,7 @@ public class MainActivity extends Activity {
             }
             sRuntime = null;
             Process.killProcess(Process.myPid());
-        }, 1200);
+        });
     }
 
     @Override
