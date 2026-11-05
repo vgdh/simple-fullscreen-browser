@@ -306,6 +306,17 @@ public class MainActivity extends Activity {
             next.run();
             return;
         }
+
+        // clearData is async and this gates the first page load, so a callback
+        // that never arrives would leave a black screen with no way back. Load
+        // anyway after a short grace period; whichever path fires first wins.
+        final boolean[] fired = {false};
+        final Runnable go = () -> {
+            if (fired[0]) return;
+            fired[0] = true;
+            mainHandler.post(next);
+        };
+
         Log.i(TAG, "profile wipe for " + WIPE_TAG);
         try {
             runtime.getStorageController()
@@ -314,15 +325,16 @@ public class MainActivity extends Activity {
                             ignored -> {
                                 Log.i(TAG, "profile wiped");
                                 prefs().edit().putString(KEY_WIPE, WIPE_TAG).apply();
-                                mainHandler.post(next);
+                                go.run();
                             },
                             err -> {
                                 Log.w(TAG, "profile wipe failed: " + err);
-                                mainHandler.post(next);
+                                go.run();
                             });
+            mainHandler.postDelayed(go, 4000);
         } catch (Throwable t) {
             Log.w(TAG, "profile wipe unavailable: " + t);
-            next.run();
+            go.run();
         }
     }
 
