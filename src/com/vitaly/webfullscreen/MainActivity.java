@@ -1,12 +1,10 @@
 package com.vitaly.webfullscreen;
 
 import android.app.Activity;
-import android.app.AlarmManager;
 import android.app.AlertDialog;
 import android.content.DialogInterface;
 import android.content.Context;
 import android.content.Intent;
-import android.app.PendingIntent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.os.Build;
@@ -74,7 +72,8 @@ public class MainActivity extends Activity {
 
     /** Lines kept on screen; attempts before the loader gives up. */
     private static final int DIAG_LINES = 6;
-    private static final int MAX_RETRY = 10;
+    /** Two attempts, then the kiosk closes itself instead of retrying forever. */
+    private static final int MAX_RETRY = 2;
 
     /** Diagnostic phase: show on screen which BACK branch ran and which build
      *  is actually installed. Flip to false once the behaviour is confirmed. */
@@ -458,7 +457,6 @@ public class MainActivity extends Activity {
         @Override
         public void onFirstContentfulPaint(GeckoSession s) {
             painted = true;
-            clearRestartBudget();
             diag("first-paint " + shortUri(currentUri));
         }
 
@@ -661,7 +659,7 @@ public class MainActivity extends Activity {
                 diag("rebuilding session");
                 mainHandler.post(() -> rebuildSession());
             } else {
-                selfRestart("blank after rebuild");
+                giveUp("blank after rebuild");
             }
             return;
         }
@@ -683,55 +681,21 @@ public class MainActivity extends Activity {
      * Gecko (dead content process) cannot be talked back to life with more loads
      * or a new session, so schedule our own relaunch and end this process.
      */
-    private void selfRestart(String why) {
-        SharedPreferences p = getSharedPreferences("kiosk", MODE_PRIVATE);
-        long now = System.currentTimeMillis();
-        long windowStart = p.getLong("restart_window", 0);
-        int count = p.getInt("restarts", 0);
-        if (now - windowStart > 10 * 60 * 1000L) {
-            windowStart = now;
-            count = 0;
-        }
-        if (count >= 3) {
-            diag("self-restart limit reached, staying up");
-            return;
-        }
-        p.edit().putLong("restart_window", windowStart)
-                .putInt("restarts", count + 1)
-                .apply();
-        diag("self-restart (" + why + ") in 5s, " + (count + 1) + "/3");
-
-        Intent relaunch = new Intent(this, MainActivity.class);
-        relaunch.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
-        PendingIntent pi = PendingIntent.getActivity(this, 0, relaunch,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        AlarmManager am = (AlarmManager) getSystemService(ALARM_SERVICE);
-        if (am != null) {
-            // Inexact is deliberate: exact alarms need a permission on API 31+.
-            am.set(AlarmManager.RTC, now + 5000, pi);
-        }
-        exiting = true;
-        finishAndRemoveTask();
-        mainHandler.postDelayed(() -> {
-            try {
-                if (sRuntime != null) sRuntime.shutdown();
-            } catch (Throwable ignored) { }
-            Process.killProcess(Process.myPid());
-        }, 1200);
-    }
-
-    private void clearRestartBudget() {
-        SharedPreferences p = getSharedPreferences("kiosk", MODE_PRIVATE);
-        if (p.getInt("restarts", 0) != 0) {
-            p.edit().putInt("restarts", 0).remove("restart_window").apply();
-        }
+    /**
+     * Recovery is the owner's call, not the app's: a dashboard that cannot be
+     * loaded closes the kiosk exactly like a double-BACK exit, so whatever
+     * launched it (Kodi, the launcher) decides what happens next. Retrying
+     * forever only hides the fault behind a white screen.
+     */
+    private void giveUp(String why) {
+        diag("giving up: " + why);
+        exitApp();
     }
 
     private void scheduleRetry() {
         if (session == null || isFinishing() || targetUrl == null) return;
         if (retryCount >= MAX_RETRY) {
-            diag("giving up after " + MAX_RETRY + " tries");
-            selfRestart("no paint after retries");
+            giveUp("no paint after " + MAX_RETRY + " retries");
             return;
         }
         retryCount++;
