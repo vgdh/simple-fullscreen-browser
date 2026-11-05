@@ -128,6 +128,9 @@ public class MainActivity extends Activity {
     /** A spaced blank-retry is already queued; blank page-stops must not stack. */
     private boolean blankRetryPending;
 
+    /** Session rebuilds attempted for this activity; 2 is plenty. */
+    private int rebuilds;
+
     /** Marks the live activity so a pending exit-kill cannot hit a fresh launch. */
     private static MainActivity activeActivity;
     private static long exitStamp;
@@ -199,21 +202,7 @@ public class MainActivity extends Activity {
                 .build();
         runtime = runtimeForProcess(this, rtSettings);
 
-        GeckoSessionSettings sessionSettings = new GeckoSessionSettings.Builder()
-                // Desktop UA + desktop viewport: the TV is a big fixed screen,
-                // so it should get the desktop layout, not a phone layout.
-                .userAgentMode(GeckoSessionSettings.USER_AGENT_MODE_DESKTOP)
-                .viewportMode(GeckoSessionSettings.VIEWPORT_MODE_DESKTOP)
-                // No browser chrome exists here, so viewport units must be
-                // measured against the whole screen (100vh == screen height).
-                .displayMode(GeckoSessionSettings.DISPLAY_MODE_FULLSCREEN)
-                .allowJavascript(true)
-                .build();
-
-        session = new GeckoSession(sessionSettings);
-        session.setProgressDelegate(new ProgressDelegate());
-        session.setNavigationDelegate(new NavigationDelegate());
-        session.setContentDelegate(new ContentDelegate());
+        session = newSession();
         session.open(runtime);
         view.setSession(session);
         view.setFocusable(true);
@@ -269,6 +258,59 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** A fully wired session, not yet opened. */
+    private GeckoSession newSession() {
+        GeckoSessionSettings sessionSettings = new GeckoSessionSettings.Builder()
+                // Desktop UA + desktop viewport: the TV is a big fixed screen,
+                // so it should get the desktop layout, not a phone layout.
+                .userAgentMode(GeckoSessionSettings.USER_AGENT_MODE_DESKTOP)
+                .viewportMode(GeckoSessionSettings.VIEWPORT_MODE_DESKTOP)
+                // No browser chrome exists here, so viewport units must be
+                // measured against the whole screen (100vh == screen height).
+                .displayMode(GeckoSessionSettings.DISPLAY_MODE_FULLSCREEN)
+                .allowJavascript(true)
+                .build();
+        GeckoSession s = new GeckoSession(sessionSettings);
+        s.setProgressDelegate(new ProgressDelegate());
+        s.setNavigationDelegate(new NavigationDelegate());
+        s.setContentDelegate(new ContentDelegate());
+        return s;
+    }
+
+    /**
+     * Throw away a session that refuses to navigate and build a fresh one. A
+     * session stuck committing about:blank never recovers from more loadUri()
+     * calls, so this is the only escalation left short of restarting the app.
+     */
+    private void rebuildSession() {
+        if (isFinishing() || runtime == null) return;
+        String url = targetUrl;
+        diag("rebuild: closing old session");
+        try {
+            if (session != null) session.close();
+        } catch (Throwable t) {
+            Log.i(TAG, "rebuild: close threw " + t);
+        }
+        session = null;
+        if (view != null) view.setSession(null);
+
+        session = newSession();
+        session.open(runtime);
+        if (view != null) {
+            view.setSession(session);
+            view.setFocusable(true);
+            view.requestFocus();
+            session.setActive(true);
+            session.setFocused(true);
+        }
+        blankLoads = 0;
+        retryCount = 0;
+        pageLoaded = false;
+        painted = false;
+        repaintRetryDone = false;
+        if (url != null) load(url);
+    }
+
     /** Return the process-wide runtime, creating it on first use only. */
     private static synchronized GeckoRuntime runtimeForProcess(
             Context ctx, GeckoRuntimeSettings settings) {
@@ -307,6 +349,14 @@ public class MainActivity extends Activity {
     // ---------------------------------------------------------------- delegates
 
     private class ProgressDelegate implements GeckoSession.ProgressDelegate {
+        @Override
+        public void onPageStart(GeckoSession s, String url) {
+            // The decisive line: if this never shows the target URL, the engine
+            // never started our navigation at all (a dropped load), rather than
+            // starting it and aborting it.
+            diag("page-start " + shortUri(url));
+        }
+
         @Override
         public void onPageStop(GeckoSession s, boolean success) {
             // Gecko paints its own progress; we only care about restoring the
@@ -580,7 +630,14 @@ public class MainActivity extends Activity {
     private void scheduleBlankRetry() {
         if (blankRetryPending || targetUrl == null) return;
         if (blankLoads >= MAX_BLANK_LOADS) {
-            diag("still about:blank after " + MAX_BLANK_LOADS + " loads");
+            // Re-loading a wedged session never works; replace the session.
+            if (rebuilds < 2) {
+                rebuilds++;
+                diag("rebuilding session " + rebuilds + "/2");
+                mainHandler.post(() -> rebuildSession());
+            } else {
+                diag("still about:blank after rebuild");
+            }
             return;
         }
         blankLoads++;

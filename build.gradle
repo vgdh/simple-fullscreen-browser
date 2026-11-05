@@ -14,8 +14,8 @@ android {
         // GeckoView 159 refuses anything below API 26; the TV reports 31.
         minSdk 26
         targetSdk 34
-        versionCode 16
-        versionName '3.0-geckoview'
+        versionCode 17
+        versionName '3.1-geckoview'
 
         // Default: universal APK (both ABIs). Override with
         //   -Pabis=arm64-v8a         (half the size, needs a 64-bit TV)
