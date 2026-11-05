@@ -10,6 +10,7 @@ import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.net.ConnectivityManager;
 import android.os.Looper;
 import android.text.InputType;
 import android.util.Log;
@@ -64,8 +65,12 @@ public class MainActivity extends Activity {
     private static final String KEY_WIPE = "wipe_tag";
     private static final String WIPE_TAG = "2.5";
 
-    /** Show a one-line boot state on screen: no console exists on the TV. */
+    /** Show a rolling event log on screen: no console exists on the TV. */
     private static final boolean BOOT_DIAG = true;
+
+    /** Lines kept on screen; attempts before the loader gives up. */
+    private static final int DIAG_LINES = 6;
+    private static final int MAX_RETRY = 10;
 
     /** Diagnostic phase: show on screen which BACK branch ran and which build
      *  is actually installed. Flip to false once the behaviour is confirmed. */
@@ -109,8 +114,17 @@ public class MainActivity extends Activity {
     /** URL the last load() asked for; compared against currentUri for BACK. */
     private String targetUrl;
 
-    /** Retried once already after a load that never reported onPageStop. */
-    private boolean retried;
+    /** Attempts since the last successful page-stop (0 = clean). */
+    private int retryCount;
+
+    /** Engine fired onFirstContentfulPaint for the current document. */
+    private boolean painted;
+
+    /** Already reloaded once because a page "loaded" and never painted. */
+    private boolean repaintRetryDone;
+
+    /** Rolling event log: one line is overwritten too fast to read. */
+    private final java.util.ArrayDeque<String> diagLog = new java.util.ArrayDeque<>();
 
     /** Pending "did the page actually arrive" check. */
     private Runnable loadWatchdog;
@@ -138,7 +152,7 @@ public class MainActivity extends Activity {
         if (BOOT_DIAG) {
             diagView = new TextView(this);
             diagView.setTextColor(Color.WHITE);
-            diagView.setTextSize(11f);
+            diagView.setTextSize(9f);
             diagView.setPadding(12, 8, 12, 8);
             diagView.setBackgroundColor(0x99000000);
             FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
@@ -181,7 +195,9 @@ public class MainActivity extends Activity {
         view.requestFocus();
 
         enterImmersive();
-        diag("created, runtime=" + (runtime != null));
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+        diag("created runtime=" + (runtime != null)
+                + " net=" + (cm != null && cm.getActiveNetwork() != null));
         startWithIntentOrSaved(getIntent());
     }
 
@@ -270,11 +286,28 @@ public class MainActivity extends Activity {
             // Gecko paints its own progress; we only care about restoring the
             // immersive bars, which video fullscreen can knock out.
             pageLoaded = true;
+            retryCount = 0;
             if (loadWatchdog != null) {
                 mainHandler.removeCallbacks(loadWatchdog);
                 loadWatchdog = null;
             }
-            diag("page-stop success=" + success + " " + shortUri(currentUri));
+            diag("page-stop success=" + success + " painted=" + painted
+                    + " " + shortUri(currentUri));
+            if (success && !painted && !repaintRetryDone) {
+                // "Loaded" without a paint is a blank kiosk: the engine holds the
+                // document, the wallpaper-less black screen shows nothing.
+                repaintRetryDone = true;
+                mainHandler.postDelayed(() -> {
+                    if (!isFinishing() && session != null && !painted && targetUrl != null) {
+                        diag("loaded but never painted, reloading");
+                        pageLoaded = false;
+                        painted = false;
+                        session.load(new GeckoSession.Loader()
+                                .uri(targetUrl)
+                                .flags(GeckoSession.LOAD_FLAGS_BYPASS_CACHE));
+                    }
+                }, 2500);
+            }
             enterImmersive();
         }
     }
@@ -290,6 +323,11 @@ public class MainActivity extends Activity {
                                                WebRequestError error) {
             String code = "code=" + error.code + " cat=" + error.category;
             diag("load-error " + code + " " + shortUri(uri));
+            if (loadWatchdog != null) {
+                mainHandler.removeCallbacks(loadWatchdog);
+                loadWatchdog = null;
+            }
+            scheduleRetry();
             // Returning null shows GeckoView's own Chrome-style error page, which
             // on a kiosk reads as a broken app. Draw our own instead: black
             // background, the failing address and the real Gecko code.
@@ -313,6 +351,19 @@ public class MainActivity extends Activity {
     }
 
     private class ContentDelegate implements GeckoSession.ContentDelegate {
+        @Override
+        public void onFirstContentfulPaint(GeckoSession s) {
+            painted = true;
+            diag("first-paint " + shortUri(currentUri));
+        }
+
+        @Override
+        public void onPaintStatusReset(GeckoSession s) {
+            // The engine dropped the painted document (crash/recomposite):
+            // whatever is on screen now is not the page we loaded.
+            painted = false;
+        }
+
         @Override
         public void onFullScreen(GeckoSession s, boolean fullScreen) {
             // The activity is already fullscreen; HTML5 fullscreen only needs
@@ -400,44 +451,72 @@ public class MainActivity extends Activity {
     private void load(String url) {
         if (session == null) return;
         targetUrl = url;
-        retried = false;
         pageLoaded = false;
-        diag("load " + shortUri(url));
-        session.loadUri(url);
+        painted = false;
+        repaintRetryDone = false;
+        boolean again = retryCount > 0;
+        diag("load " + (again ? "retry " + retryCount + "/" + MAX_RETRY + " " : "")
+                + shortUri(url));
+        if (again) {
+            // From the second attempt on, the cached copy may be the broken one.
+            session.load(new GeckoSession.Loader()
+                    .uri(url)
+                    .flags(GeckoSession.LOAD_FLAGS_BYPASS_CACHE));
+        } else {
+            session.loadUri(url);
+        }
         armLoadWatchdog();
         enterImmersive();
     }
 
     /**
      * A load that never reports onPageStop leaves an endless black screen and no
-     * way to tell whether the engine, the network or the URL is at fault. Check
-     * after 8s; if the page never arrived, re-issue it once with the HTTP cache
-     * bypassed, then say so on screen instead of staying silent.
+     * way to tell whether the engine, the network or the URL is at fault.
      */
     private void armLoadWatchdog() {
         if (loadWatchdog != null) mainHandler.removeCallbacks(loadWatchdog);
         loadWatchdog = () -> {
             loadWatchdog = null;
             if (pageLoaded || isFinishing() || session == null) return;
-            if (!retried && targetUrl != null) {
-                retried = true;
-                diag("no page-stop after 8s, retrying");
-                session.load(new GeckoSession.Loader()
-                        .uri(targetUrl)
-                        .flags(GeckoSession.LOAD_FLAGS_BYPASS_CACHE));
-                armLoadWatchdog();
-            } else {
-                diag("still blank: " + shortUri(targetUrl));
-            }
+            diag("no page-stop after 10s");
+            scheduleRetry();
         };
-        mainHandler.postDelayed(loadWatchdog, 8000);
+        mainHandler.postDelayed(loadWatchdog, 10000);
     }
 
-    /** One-line boot state in the corner. Costs nothing when BOOT_DIAG is off. */
+    /**
+     * A TV that has just woken from standby often has no usable Wi-Fi for a few
+     * seconds; the load then dies with "network unreachable" and the kiosk sits
+     * on that error page until someone restarts the app. Keep trying until a
+     * page actually arrives.
+     */
+    private void scheduleRetry() {
+        if (session == null || isFinishing() || targetUrl == null) return;
+        if (retryCount >= MAX_RETRY) {
+            diag("giving up after " + MAX_RETRY + " tries");
+            return;
+        }
+        retryCount++;
+        diag("retry " + retryCount + "/" + MAX_RETRY + " in 3s");
+        mainHandler.postDelayed(() -> {
+            if (!pageLoaded) load(targetUrl);
+        }, 3000);
+    }
+
+    /**
+     * Rolling event log in the corner. A single line is not enough: the
+     * dashboard's own onPageStop lands after the load-error that explains the
+     * screen and wipes the only evidence off the screen.
+     */
     private void diag(String msg) {
         Log.i(TAG, "diag: " + msg);
-        if (!BOOT_DIAG || diagView == null) return;
-        diagView.setText(label + "\n" + msg);
+        if (!BOOT_DIAG) return;
+        diagLog.addLast(msg.length() > 66 ? msg.substring(0, 66) : msg);
+        while (diagLog.size() > DIAG_LINES) diagLog.removeFirst();
+        if (diagView == null) return;
+        StringBuilder sb = new StringBuilder(label);
+        for (String line : diagLog) sb.append('\n').append(line);
+        diagView.setText(sb.toString());
     }
 
     private static String shortUri(String uri) {
@@ -577,8 +656,12 @@ public class MainActivity extends Activity {
         // "canGoBack" alone can stay true forever and BACK never exits.
         boolean offStart = currentUri != null && targetUrl != null
                 && !samePage(currentUri, targetUrl);
-        boolean history = offStart && session != null && canGoBack;
-        String what = history ? "goBack (page history)" : "exitApp";
+        // Never goBack() to the dashboard: a history restore can hand back the
+        // document with its bundle unexecuted, or land on the error entry that a
+        // failed card left behind. A plain load is the path startup already
+        // works on, so reuse it.
+        boolean history = offStart && session != null;
+        String what = history ? "load start page" : "exitApp";
         Log.i(TAG, "BACK canGoBack=" + canGoBack + " offStart=" + offStart
                 + " -> " + what + " build=" + label);
         diag("BACK offStart=" + offStart + " -> " + what);
@@ -587,7 +670,8 @@ public class MainActivity extends Activity {
                     Toast.LENGTH_LONG).show();
         }
         if (history) {
-            session.goBack();
+            retryCount = 0;
+            load(targetUrl);
             return;
         }
         exitApp();
