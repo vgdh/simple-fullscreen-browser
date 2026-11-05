@@ -1,10 +1,12 @@
 package com.vitaly.webfullscreen;
 
 import android.app.Activity;
+import android.app.AlarmManager;
 import android.app.AlertDialog;
 import android.content.DialogInterface;
 import android.content.Context;
 import android.content.Intent;
+import android.app.PendingIntent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.os.Build;
@@ -117,7 +119,7 @@ public class MainActivity extends Activity {
     private static final long EXIT_CONFIRM_MS = 2500;
 
     /** How many times a swallowed load may be re-issued before giving up quietly. */
-    private static final int MAX_BLANK_LOADS = 4;
+    private static final int MAX_BLANK_LOADS = 2;
 
     private long lastBackAt;
     private long exitArmedAt;
@@ -456,6 +458,7 @@ public class MainActivity extends Activity {
         @Override
         public void onFirstContentfulPaint(GeckoSession s) {
             painted = true;
+            clearRestartBudget();
             diag("first-paint " + shortUri(currentUri));
         }
 
@@ -653,12 +656,12 @@ public class MainActivity extends Activity {
         if (blankRetryPending || targetUrl == null) return;
         if (blankLoads >= MAX_BLANK_LOADS) {
             // Re-loading a wedged session never works; replace the session.
-            if (rebuilds < 2) {
+            if (rebuilds < 1) {
                 rebuilds++;
-                diag("rebuilding session " + rebuilds + "/2");
+                diag("rebuilding session");
                 mainHandler.post(() -> rebuildSession());
             } else {
-                diag("still about:blank after rebuild");
+                selfRestart("blank after rebuild");
             }
             return;
         }
@@ -674,10 +677,61 @@ public class MainActivity extends Activity {
         }, 2000);
     }
 
+    /**
+     * The one recovery that provably works on this box is a fresh process: the
+     * owner's manual workaround was exit, wait a few seconds, relaunch. A wedged
+     * Gecko (dead content process) cannot be talked back to life with more loads
+     * or a new session, so schedule our own relaunch and end this process.
+     */
+    private void selfRestart(String why) {
+        SharedPreferences p = getSharedPreferences("kiosk", MODE_PRIVATE);
+        long now = System.currentTimeMillis();
+        long windowStart = p.getLong("restart_window", 0);
+        int count = p.getInt("restarts", 0);
+        if (now - windowStart > 10 * 60 * 1000L) {
+            windowStart = now;
+            count = 0;
+        }
+        if (count >= 3) {
+            diag("self-restart limit reached, staying up");
+            return;
+        }
+        p.edit().putLong("restart_window", windowStart)
+                .putInt("restarts", count + 1)
+                .apply();
+        diag("self-restart (" + why + ") in 5s, " + (count + 1) + "/3");
+
+        Intent relaunch = new Intent(this, MainActivity.class);
+        relaunch.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+        PendingIntent pi = PendingIntent.getActivity(this, 0, relaunch,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        AlarmManager am = (AlarmManager) getSystemService(ALARM_SERVICE);
+        if (am != null) {
+            // Inexact is deliberate: exact alarms need a permission on API 31+.
+            am.set(AlarmManager.RTC, now + 5000, pi);
+        }
+        exiting = true;
+        finishAndRemoveTask();
+        mainHandler.postDelayed(() -> {
+            try {
+                if (sRuntime != null) sRuntime.shutdown();
+            } catch (Throwable ignored) { }
+            Process.killProcess(Process.myPid());
+        }, 1200);
+    }
+
+    private void clearRestartBudget() {
+        SharedPreferences p = getSharedPreferences("kiosk", MODE_PRIVATE);
+        if (p.getInt("restarts", 0) != 0) {
+            p.edit().putInt("restarts", 0).remove("restart_window").apply();
+        }
+    }
+
     private void scheduleRetry() {
         if (session == null || isFinishing() || targetUrl == null) return;
         if (retryCount >= MAX_RETRY) {
             diag("giving up after " + MAX_RETRY + " tries");
+            selfRestart("no paint after retries");
             return;
         }
         retryCount++;
