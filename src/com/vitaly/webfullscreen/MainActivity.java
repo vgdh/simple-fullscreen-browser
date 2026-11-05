@@ -9,6 +9,8 @@ import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.InputType;
 import android.util.Log;
 import android.view.KeyEvent;
@@ -26,6 +28,7 @@ import org.mozilla.geckoview.GeckoRuntimeSettings;
 import org.mozilla.geckoview.GeckoSession;
 import org.mozilla.geckoview.GeckoSessionSettings;
 import org.mozilla.geckoview.GeckoView;
+import org.mozilla.geckoview.StorageController;
 import org.mozilla.geckoview.WebRequestError;
 
 /**
@@ -55,6 +58,10 @@ public class MainActivity extends Activity {
     private static final String PREFS = "settings";
     private static final String KEY_URL = "start_url";
 
+    /** One-time profile wipe marker: bump the tag to wipe once on next launch. */
+    private static final String KEY_WIPE = "wipe_tag";
+    private static final String WIPE_TAG = "2.4";
+
     /** Diagnostic phase: show on screen which BACK branch ran and which build
      *  is actually installed. Flip to false once the behaviour is confirmed. */
     private static final boolean BACK_DIAGNOSTIC = false;
@@ -71,6 +78,8 @@ public class MainActivity extends Activity {
      * for the whole process and reuse it for every activity instance.
      */
     private static GeckoRuntime sRuntime;
+
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private GeckoRuntime runtime;
     private GeckoSession session;
@@ -269,18 +278,51 @@ public class MainActivity extends Activity {
 
     private void startWithIntentOrSaved(Intent intent) {
         String url = urlFrom(intent);
-        if (url != null) {
-            // Explicit request (Kodi): honour it, and remember it as the start
-            // page when nothing is stored yet.
-            if (storedUrl() == null) persist(url);
-            load(url);
+        if (url != null && storedUrl() == null) {
+            // Explicit request (Kodi): remember it as the start page.
+            persist(url);
+        }
+        final String target = url != null ? url : storedUrl();
+        clearProfileOnce(() -> {
+            if (target != null) load(target);
+            else promptForUrl();
+        });
+    }
+
+    /**
+     * Wipe the Gecko profile once, before the first page load of a new build.
+     *
+     * Homer ships a service worker that precaches index.html with a fixed
+     * revision and answers navigations from that cache. A stale worker on the
+     * TV therefore serves the pre-patch page indefinitely: the injected
+     * kiosk-keys.js tag never loads, remote arrows do nothing, and
+     * force-stopping the app does not help because the worker lives in the
+     * profile on disk. LOAD_FLAGS_BYPASS_CACHE does not reach the service
+     * worker either. clearData(ALL) drops the worker, its caches and the HTTP
+     * cache, so the next load comes straight off the network once.
+     */
+    private void clearProfileOnce(final Runnable next) {
+        if (WIPE_TAG.equals(prefs().getString(KEY_WIPE, ""))) {
+            next.run();
             return;
         }
-        String saved = storedUrl();
-        if (saved != null) {
-            load(saved);
-        } else {
-            promptForUrl();
+        Log.i(TAG, "profile wipe for " + WIPE_TAG);
+        try {
+            runtime.getStorageController()
+                    .clearData(StorageController.ClearFlags.ALL)
+                    .accept(
+                            ignored -> {
+                                Log.i(TAG, "profile wiped");
+                                prefs().edit().putString(KEY_WIPE, WIPE_TAG).apply();
+                                mainHandler.post(next);
+                            },
+                            err -> {
+                                Log.w(TAG, "profile wipe failed: " + err);
+                                mainHandler.post(next);
+                            });
+        } catch (Throwable t) {
+            Log.w(TAG, "profile wipe unavailable: " + t);
+            next.run();
         }
     }
 
