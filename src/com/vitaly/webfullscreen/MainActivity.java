@@ -3,12 +3,14 @@ package com.vitaly.webfullscreen;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.DialogInterface;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
+import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -53,6 +55,23 @@ public class MainActivity extends Activity {
     private static final String PREFS = "settings";
     private static final String KEY_URL = "start_url";
 
+    /** Diagnostic phase: show on screen which BACK branch ran and which build
+     *  is actually installed. Flip to false once the behaviour is confirmed. */
+    private static final boolean BACK_DIAGNOSTIC = false;
+
+    private static final String TAG = "KioskBack";
+
+    /**
+     * GeckoRuntime is one-per-process: GeckoRuntime.create() calls init(), which
+     * returns false and throws IllegalStateException("Failed to initialize
+     * GeckoRuntime") when a runtime already exists in this process. Exiting the
+     * activity does not kill the process, so creating a runtime in onCreate()
+     * made the *second* launch of the app die instantly, and the third one
+     * inherit a half-initialised engine (white screen). Keep one runtime alive
+     * for the whole process and reuse it for every activity instance.
+     */
+    private static GeckoRuntime sRuntime;
+
     private GeckoRuntime runtime;
     private GeckoSession session;
     private GeckoView view;
@@ -60,6 +79,15 @@ public class MainActivity extends Activity {
 
     /** Kept up to date by NavigationDelegate; 159 dropped getSessionHistory(). */
     private boolean canGoBack;
+
+    /** Set once the page has painted; gates the reload-on-resume below. */
+    private boolean pageLoaded;
+
+    /** The first onResume() follows onCreate(), which already started a load. */
+    private boolean firstResume = true;
+
+    /** Guards against BACK being dispatched twice (onKeyDown + onBackPressed). */
+    private boolean exiting;
 
     // ---------------------------------------------------------------- lifecycle
 
@@ -88,7 +116,7 @@ public class MainActivity extends Activity {
                 // Remote page console -> logcat (adb logcat -s GeckoView).
                 .consoleOutput(false)
                 .build();
-        runtime = GeckoRuntime.create(this, rtSettings);
+        runtime = runtimeForProcess(this, rtSettings);
 
         GeckoSessionSettings sessionSettings = new GeckoSessionSettings.Builder()
                 // Desktop UA + desktop viewport: the TV is a big fixed screen,
@@ -122,6 +150,12 @@ public class MainActivity extends Activity {
         if (url != null) {
             if (storedUrl() == null) persist(url);
             load(url);
+        } else if (session != null && pageLoaded) {
+            // Relaunched with no explicit URL: the page on screen may be hours
+            // old, which is what a kiosk dashboard must never show. Bypass the
+            // HTTP cache too, otherwise "reload" can repaint the same bytes.
+            pageLoaded = false;
+            session.reload(GeckoSession.LOAD_FLAGS_BYPASS_CACHE);
         }
     }
 
@@ -134,11 +168,36 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        boolean comingBack = !firstResume;
+        firstResume = false;
+
         if (session != null) {
             session.setActive(true);
             session.setFocused(true);
         }
         enterImmersive();
+
+        // Returning from the background (screen off, Kodi, another app) means
+        // whatever the dashboard fetched last time is stale: reload it.
+        if (comingBack && pageLoaded && session != null) {
+            pageLoaded = false;
+            session.reload(GeckoSession.LOAD_FLAGS_BYPASS_CACHE);
+        }
+    }
+
+    /** Return the process-wide runtime, creating it on first use only. */
+    private static synchronized GeckoRuntime runtimeForProcess(
+            Context ctx, GeckoRuntimeSettings settings) {
+        if (sRuntime != null) return sRuntime;
+        try {
+            sRuntime = GeckoRuntime.create(ctx.getApplicationContext(), settings);
+        } catch (IllegalStateException e) {
+            // A runtime already owns this process; adopt it instead of dying.
+            sRuntime = GeckoRuntime.getDefault(ctx);
+            if (sRuntime == null) throw e;
+        }
+        Log.i(TAG, "GeckoRuntime: " + (sRuntime != null ? "ready" : "null"));
+        return sRuntime;
     }
 
     @Override
@@ -167,6 +226,7 @@ public class MainActivity extends Activity {
         public void onPageStop(GeckoSession s, boolean success) {
             // Gecko paints its own progress; we only care about restoring the
             // immersive bars, which video fullscreen can knock out.
+            pageLoaded = true;
             enterImmersive();
         }
     }
@@ -270,7 +330,7 @@ public class MainActivity extends Activity {
                         new DialogInterface.OnClickListener() {
                             @Override
                             public void onClick(DialogInterface d, int which) {
-                                finish();
+                                exitApp();
                             }
                         })
                 .create();
@@ -349,11 +409,49 @@ public class MainActivity extends Activity {
 
     /** Back: page history first, then exit to whoever launched us. */
     private void handleBack() {
-        if (session != null && canGoBack) {
+        if (exiting) return;              // onKeyDown and onBackPressed both fire on some builds
+        boolean history = (session != null && canGoBack);
+        String what = history ? "goBack (page history)" : "exitApp";
+        Log.i(TAG, "BACK canGoBack=" + canGoBack + " -> " + what + " build=" + buildLabel());
+        if (BACK_DIAGNOSTIC) {
+            Toast.makeText(this, "BACK -> " + what + "\n" + buildLabel(),
+                    Toast.LENGTH_LONG).show();
+        }
+        if (history) {
             session.goBack();
             return;
         }
-        finish();
+        exitApp();
+    }
+
+    /** versionName (versionCode) of the package that is actually installed. */
+    private String buildLabel() {
+        try {
+            android.content.pm.PackageInfo pi =
+                    getPackageManager().getPackageInfo(getPackageName(), 0);
+            int code = Build.VERSION.SDK_INT >= 28
+                    ? (int) pi.getLongVersionCode() : pi.versionCode;
+            return pi.versionName + " vc" + code;
+        } catch (Exception e) {
+            return "unknown build";
+        }
+    }
+
+    /**
+     * Leave for real. finish() alone only ends this activity and leaves the
+     * task sitting behind Kodi — reopening then resumes the same instance with
+     * the same stale page. finishAndRemoveTask() drops the task, so the next
+     * launch is a cold start with a fresh load.
+     */
+    private void exitApp() {
+        exiting = true;
+        Log.i(TAG, "exitApp: finishAndRemoveTask(), task id " + getTaskId());
+        if (Build.VERSION.SDK_INT >= 21) {
+            finishAndRemoveTask();
+            Log.i(TAG, "exitApp: isFinishing=" + isFinishing());
+        } else {
+            finish();
+        }
     }
 
     @Override
