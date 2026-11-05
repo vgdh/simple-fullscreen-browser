@@ -12,6 +12,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.net.ConnectivityManager;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.text.InputType;
 import android.util.Log;
 import android.view.Gravity;
@@ -107,6 +108,15 @@ public class MainActivity extends Activity {
 
     /** Guards against BACK being dispatched twice (onKeyDown + onBackPressed). */
     private boolean exiting;
+
+    /** A single physical BACK press can arrive twice (onKeyDown + onBackPressed). */
+    private static final long BACK_DEBOUNCE_MS = 250;
+
+    /** Two deliberate presses inside this window mean "yes, leave the kiosk". */
+    private static final long EXIT_CONFIRM_MS = 2500;
+
+    private long lastBackAt;
+    private long exitArmedAt;
 
     /** Last committed location, fed by onLocationChange (159 has no getCurrentUri). */
     private String currentUri;
@@ -650,6 +660,9 @@ public class MainActivity extends Activity {
     /** Back: page history first, then exit to whoever launched us. */
     private void handleBack() {
         if (exiting) return;              // onKeyDown and onBackPressed both fire on some builds
+        long now = SystemClock.uptimeMillis();
+        if (now - lastBackAt < BACK_DEBOUNCE_MS) return;
+        lastBackAt = now;
 
         // Exit once we are on the start page again, instead of walking the
         // whole session history: a failed navigation leaves its own entry, so
@@ -674,7 +687,15 @@ public class MainActivity extends Activity {
             load(targetUrl);
             return;
         }
-        exitApp();
+
+        // A kiosk must not die from one stray press of a TV remote: the first
+        // BACK only warns, a second one inside the window really exits.
+        if (now - exitArmedAt <= EXIT_CONFIRM_MS) {
+            exitApp();
+            return;
+        }
+        exitArmedAt = now;
+        Toast.makeText(this, R.string.press_back_again, Toast.LENGTH_SHORT).show();
     }
 
     /** Same document? Trailing slash and empty path must not count as a change. */
