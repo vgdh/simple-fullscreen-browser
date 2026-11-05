@@ -15,7 +15,7 @@ android {
         minSdk 26
         targetSdk 34
         versionCode 24
-        versionName '3.4.1-geckoview'
+        versionName '3.8-geckoview'
 
         // Default: universal APK (both ABIs). Override with
         //   -Pabis=arm64-v8a         (half the size, needs a 64-bit TV)
