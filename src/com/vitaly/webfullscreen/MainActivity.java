@@ -134,6 +134,7 @@ public class MainActivity extends Activity {
         root.addView(view, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
+        setContentView(root);
         if (BOOT_DIAG) {
             diagView = new TextView(this);
             diagView.setTextColor(Color.WHITE);
